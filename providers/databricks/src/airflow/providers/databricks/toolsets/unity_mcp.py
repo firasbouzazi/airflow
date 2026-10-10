@@ -20,26 +20,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
+import json
 import re
 import threading
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from airflow.providers.common.compat.sdk import AirflowOptionalProviderFeatureException
 from airflow.providers.databricks.exceptions import (
     DatabricksUnityMCPAccessDeniedError,
     DatabricksUnityMCPError,
-    DatabricksUnityMCPServiceNotFoundError,
     DatabricksUnityMCPThrottledError,
     DatabricksUnityMCPTransportError,
 )
 from airflow.providers.databricks.hooks.databricks import DatabricksHook
 
 try:
+    # httpx2 and fastmcp come with pydantic-ai's mcp extra, which the common.ai extra installs.
     import httpx2
     from fastmcp.client.transports import StreamableHttpTransport
+    from fastmcp.exceptions import McpError
     from pydantic_ai.mcp import MCPToolset as PydanticAIMCPToolset
 
-    from airflow.providers.common.ai.toolsets.mcp import MCPToolset
+    from airflow.providers.common.ai.utils.toolset_base import AirflowToolset
 except ImportError as e:
     raise AirflowOptionalProviderFeatureException(
         "DatabricksUnityMCPToolset needs the 'common.ai' extra of the databricks provider: "
@@ -52,6 +57,7 @@ if TYPE_CHECKING:
     from pydantic_ai._run_context import RunContext
     from pydantic_ai.toolsets.abstract import ToolsetTool
 
+    from airflow.providers.common.ai.tools import AirflowTool
     from airflow.sdk.execution_time.secrets_masker import mask_secret
 else:
     try:
@@ -66,21 +72,52 @@ GATEWAY_MCP_SERVICES_PATH = "ai-gateway/mcp-services"
 
 # Restricting each part to these characters keeps the name from adding a path, query or
 # fragment to the URL, so the request can only reach the service path on the connection's host.
-_SERVICE_NAME_PART = r"[A-Za-z0-9_-]+"
+_SERVICE_NAME_PART = r"[A-Za-z0-9_]+"
 _SERVICE_NAME = re.compile(rf"{_SERVICE_NAME_PART}\.{_SERVICE_NAME_PART}\.{_SERVICE_NAME_PART}")
+
+# The JSON-RPC error code Unity Gateway answers with, at HTTP 403, when the caller may not invoke
+# the service, including when no service has that name.
+_NOT_AUTHORIZED_CODE = -32007
+
+# Errors the MCP client makes up when the gateway gave no JSON-RPC answer, such as an HTTP error
+# with a plain body or a response that never arrived (see mcp.client.streamable_http). Every other
+# MCP error is the server's own answer. Matched on code and message, the only things they carry.
+_CLIENT_ERRORS = {
+    (-32603, "Server returned an error response"),
+    (-32601, "Not Found"),
+    (-32600, "Session terminated"),
+    (-32000, "Connection closed"),
+}
+_CLIENT_ERROR_PREFIXES = (
+    "Unexpected content type:",
+    "Failed to parse JSON response:",
+    "Failed to parse SSE message:",
+    "SSE stream ended without a response",
+    "server answered a request with 202 Accepted",
+    "Redirect to ",
+)
 
 
 def validate_service_name(service_name: str) -> None:
     """
     Raise ``ValueError`` unless ``service_name`` is a three-level ``catalog.schema.service`` name.
 
-    Each part may contain only ASCII letters, digits, underscores and hyphens.
+    Each part may contain only ASCII letters, digits and underscores.
     """
     if not isinstance(service_name, str) or not _SERVICE_NAME.fullmatch(service_name):
         raise ValueError(
             f"Invalid Unity Gateway MCP Service name {service_name!r}: expected "
-            "'catalog.schema.service', each part made of ASCII letters, digits, '_' or '-'."
+            "'catalog.schema.service', each part made of ASCII letters, digits or '_'."
         )
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -94,16 +131,16 @@ def _parse_retry_after(value: str | None) -> float | None:
     return seconds if seconds >= 0 else None
 
 
-def _find_transport_error(exc: BaseException) -> httpx2.TransportError | None:
-    """Return the network error behind ``exc``, looking through causes and exception groups."""
+def _find(exc: BaseException, types: type[BaseException] | tuple[type[BaseException], ...]) -> Any:
+    """Return the first exception of ``types`` in ``exc``, its causes and any exception groups."""
     seen: set[int] = set()
     pending: list[BaseException] = [exc]
     while pending:
-        current = pending.pop()
+        current = pending.pop(0)
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, httpx2.TransportError):
+        if isinstance(current, types):
             return current
         # Duck-typed: the ExceptionGroup builtin is Python 3.11+, and anyio uses the backport on 3.10.
         if isinstance(grouped := getattr(current, "exceptions", None), (list, tuple)):
@@ -112,24 +149,44 @@ def _find_transport_error(exc: BaseException) -> httpx2.TransportError | None:
     return None
 
 
+def _is_client_error(error: McpError) -> bool:
+    code, message = error.error.code, error.error.message
+    return (code, message) in _CLIENT_ERRORS or message.startswith(_CLIENT_ERROR_PREFIXES)
+
+
+class _TokenUnavailableError(Exception):
+    """Raised, for this module only, when no token could be fetched for a gateway request."""
+
+
+@dataclass(eq=False)
+class _Operation:
+    """
+    One toolset operation (connecting, listing tools or calling a tool) and the gateway errors seen while it ran.
+
+    The MCP client does not say which HTTP response made a call fail, so the errors are only
+    attributed to the operation when no other operation of the toolset ran at the same time.
+    """
+
+    overlapped: bool = False
+    errors: list[tuple[int, float | None]] = field(default_factory=list)
+
+    @property
+    def http_error(self) -> tuple[int, float | None] | None:
+        """Return the status and ``Retry-After`` of the last error response it got, if it is known."""
+        return self.errors[-1] if self.errors and not self.overlapped else None
+
+
 class _DatabricksTokenAuth(httpx2.Auth):
     """
     Authenticate each gateway request with a token from the Databricks connection.
 
     Asking the hook on every request, rather than once, lets OAuth tokens refresh during a long
     agent run and on reconnection; the hook caches tokens until they are about to expire.
-
-    The MCP client reports every HTTP error from the gateway as the same generic error, so the
-    status and ``Retry-After`` of the last error response, and any failure to get a token, are
-    kept here for :class:`DatabricksUnityMCPToolset` to report what went wrong. With concurrent
-    calls on one toolset, the error reported for a failed call can be another call's.
     """
 
-    def __init__(self, hook: DatabricksHook) -> None:
+    def __init__(self, hook: DatabricksHook, operations: set[_Operation]) -> None:
         self._hook = hook
-        self.error_status: int | None = None
-        self.retry_after: float | None = None
-        self.token_error: Exception | None = None
+        self._operations = operations
         self._token_lock = threading.Lock()
 
     def get_token(self) -> str:
@@ -147,46 +204,49 @@ class _DatabricksTokenAuth(httpx2.Auth):
         mask_secret(token)
         return token
 
-    def take_error(self) -> tuple[int | None, float | None, Exception | None]:
-        """Return the last recorded error and forget it."""
-        error = (self.error_status, self.retry_after, self.token_error)
-        self.error_status = self.retry_after = self.token_error = None
-        return error
-
-    def _record(self, response: httpx2.Response) -> None:
-        # The MCP client tolerates some error responses, such as one to a notification, so an
-        # error must not outlive the next success, or a later failure would be reported as it.
-        if response.status_code >= 400:
-            self.error_status = response.status_code
-            self.retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-        else:
-            self.error_status = self.retry_after = None
-
     async def async_auth_flow(
         self, request: httpx2.Request
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
         try:
             # Not AirflowToolset.run_blocking: its lock is shared by every toolset, so a long SQL
             # query in another toolset would hold up each request here. The connection is already
-            # resolved by _get_server, so fetching a token only calls the token endpoint, and the
-            # hook is this toolset's own, so a lock of its own is enough.
+            # resolved when the toolset connects, so fetching a token only calls the token
+            # endpoint, and the hook is this toolset's own, so a lock of its own is enough.
             token = await asyncio.to_thread(self.get_token)
         except Exception as e:
-            self.token_error = e
-            raise
+            raise _TokenUnavailableError(str(e)) from e
         request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
-        self._record(response)
+        if response.status_code >= 400 and _is_jsonrpc_request(request):
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            for operation in self._operations:
+                operation.errors.append((response.status_code, retry_after))
 
 
-class DatabricksUnityMCPToolset(MCPToolset):
+def _is_jsonrpc_request(request: httpx2.Request) -> bool:
+    """
+    Whether ``request`` sends a JSON-RPC request, which expects an answer.
+
+    Not a notification or a GET for server events: the MCP client tolerates errors on those, so
+    they say nothing about why an operation failed.
+    """
+    if request.method != "POST":
+        return False
+    try:
+        return "id" in json.loads(request.content)
+    except (ValueError, TypeError):
+        return False
+
+
+class DatabricksUnityMCPToolset(AirflowToolset):
     """
     Give an agent the tools of a Unity Gateway MCP Service, authenticated as the connection's identity.
 
     The service is named by its three-level Unity Catalog name, ``catalog.schema.service``, and
     reached at ``https://<workspace host>/ai-gateway/mcp-services/<catalog.schema.service>``. The
     workspace host and the credentials both come from the Databricks connection, so Dag code holds
-    neither a gateway URL nor a token, and the token is only ever sent to that workspace.
+    neither a gateway URL nor a token, and the token is only ever sent to that workspace, over
+    HTTPS. The connection's ``proxies`` extra applies to gateway requests.
 
     The gateway runs every tool call as the identity of the connection's credentials (a user's
     personal access token, a service principal, or an Azure AD / federated identity). That identity
@@ -195,14 +255,14 @@ class DatabricksUnityMCPToolset(MCPToolset):
     the service's policies apply.
 
     Tokens are fetched from the connection for each request, so OAuth tokens refresh during a long
-    agent run and on reconnection. Gateway errors are raised as
+    agent run and on reconnection. An error the server returns for a tool call reaches the model,
+    which can correct its arguments and try again. When the gateway gives no answer of its own, a
+    tool call may or may not have run, so it is never retried; it fails the task with
     :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPAccessDeniedError`,
-    :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPServiceNotFoundError`,
     :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPThrottledError`,
-    :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPTransportError`, or, for any
-    other gateway error, :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPError`.
-    Tool calls are never retried by this toolset, because a call interrupted after it was sent may
-    already have run.
+    :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPTransportError`, or
+    :class:`~airflow.providers.databricks.exceptions.DatabricksUnityMCPError`, as do failures
+    while connecting and listing tools.
 
     .. code-block:: python
 
@@ -223,6 +283,7 @@ class DatabricksUnityMCPToolset(MCPToolset):
     :param tool_prefix: Optional prefix prepended to tool names.
     """
 
+    # Rendered, on a copy, by AgentOperator.
     agent_template_fields: Sequence[str] = ("_databricks_conn_id", "_service_name")
 
     def __init__(
@@ -232,11 +293,12 @@ class DatabricksUnityMCPToolset(MCPToolset):
         databricks_conn_id: str = DatabricksHook.default_conn_name,
         tool_prefix: str | None = None,
     ) -> None:
-        super().__init__(databricks_conn_id, tool_prefix=tool_prefix)
         self._databricks_conn_id = databricks_conn_id
         self._service_name = service_name
-        self._auth: _DatabricksTokenAuth | None = None
-        # A templated name is checked once it has been rendered, in _get_server.
+        self._tool_prefix = tool_prefix
+        self._server: Any = None
+        self._operations: set[_Operation] = set()
+        # A templated name is checked once it has been rendered, when the toolset connects.
         if "{{" not in service_name:
             validate_service_name(service_name)
 
@@ -249,42 +311,56 @@ class DatabricksUnityMCPToolset(MCPToolset):
         validate_service_name(self._service_name)
         if not hook.host:
             raise ValueError(f"Connection {self._databricks_conn_id!r} has no workspace host.")
-        return hook._endpoint_url(f"{GATEWAY_MCP_SERVICES_PATH}/{self._service_name}")
+        url = hook._endpoint_url(f"{GATEWAY_MCP_SERVICES_PATH}/{self._service_name}")
+        parts = urlsplit(url)
+        if parts.scheme != "https" and not _is_loopback(parts.hostname or ""):
+            raise ValueError(
+                f"Connection {self._databricks_conn_id!r} uses the {parts.scheme!r} scheme. Unity Gateway "
+                "requests carry a bearer token, so they are only sent over HTTPS."
+            )
+        return url
 
     def _get_server(self) -> Any:
+        hook = DatabricksHook(self._databricks_conn_id, caller=type(self).__name__)
+        url = self.get_service_url(hook)
+        auth = _DatabricksTokenAuth(hook, self._operations)
+        # Fail here, with a clear message, rather than inside the MCP client, which reports
+        # any failure as a generic connection error.
+        auth.get_token()
+        proxy = (hook.proxies or {}).get(urlsplit(url).scheme)
+        transport = StreamableHttpTransport(
+            url,
+            headers=hook.user_agent_header,
+            auth=auth,
+            httpx_client_factory=_build_proxied_client_factory(proxy) if proxy else None,
+        )
+        toolset = PydanticAIMCPToolset(transport)
+        return toolset.prefixed(self._tool_prefix) if self._tool_prefix else toolset
+
+    async def _resolve_server(self) -> Any:
         if self._server is None:
-            hook = DatabricksHook(self._databricks_conn_id, caller=type(self).__name__)
-            url = self.get_service_url(hook)
-            auth = _DatabricksTokenAuth(hook)
-            # Fail here, with a clear message, rather than inside the MCP client, which reports
-            # any failure as a generic connection error.
-            auth.get_token()
-            transport = StreamableHttpTransport(url, headers=hook.user_agent_header, auth=auth)
-            toolset = PydanticAIMCPToolset(transport)
-            self._auth = auth
-            self._server = toolset.prefixed(self._tool_prefix) if self._tool_prefix else toolset
+            # Resolving the connection talks to the supervisor, so it takes the blocking-call lock.
+            self._server = await self.run_blocking(self._get_server)
         return self._server
 
-    def _translate_error(self, error: Exception, *, during_tool_call: bool) -> Exception | None:
+    def _translate_error(
+        self, error: Exception, operation: _Operation, *, during_tool_call: bool
+    ) -> Exception | None:
         """Return the provider exception for a gateway failure, or ``None`` to re-raise ``error`` as is."""
-        status, retry_after, token_error = self._auth.take_error() if self._auth else (None, None, None)
         service = self._service_name
-        if token_error is not None:
+        if (token_error := _find(error, _TokenUnavailableError)) is not None:
             return DatabricksUnityMCPError(
                 f"Could not get a token from connection {self._databricks_conn_id!r} to call MCP Service "
                 f"{service!r}: {token_error}"
             )
-        if status in (401, 403):
+        mcp_error = _find(error, McpError)
+        status, retry_after = operation.http_error or (None, None)
+        if (mcp_error is not None and mcp_error.error.code == _NOT_AUTHORIZED_CODE) or status in (401, 403):
             return DatabricksUnityMCPAccessDeniedError(
-                f"Unity Gateway denied access to MCP Service {service!r} (HTTP {status}). The "
-                f"identity of connection {self._databricks_conn_id!r} needs EXECUTE on the service and "
-                "USE CATALOG and USE SCHEMA on its catalog and schema, and its credentials must be valid.",
-                http_status_code=status,
-            )
-        if status == 404:
-            return DatabricksUnityMCPServiceNotFoundError(
-                f"MCP Service {service!r} was not found on the workspace of connection "
-                f"{self._databricks_conn_id!r}, or is not visible to its identity (HTTP 404).",
+                f"Unity Gateway denied access to MCP Service {service!r}"
+                f"{f' (HTTP {status})' if status else ''}. Either no service has that name, or the "
+                f"identity of connection {self._databricks_conn_id!r} lacks EXECUTE on the service or "
+                "USE CATALOG and USE SCHEMA on its catalog and schema, or its credentials are not valid.",
                 http_status_code=status,
             )
         if status == 429:
@@ -297,35 +373,56 @@ class DatabricksUnityMCPToolset(MCPToolset):
         ambiguous = (
             " The tool call may or may not have run, so it was not retried." if during_tool_call else ""
         )
-        if status is not None:
+        if mcp_error is not None:
+            if not _is_client_error(mcp_error):
+                # The server's own answer: for a tool call, it reaches the model as a retry.
+                if during_tool_call:
+                    return None
+                return DatabricksUnityMCPError(
+                    f"MCP Service {service!r} returned an error: {mcp_error.error.message} "
+                    f"(code {mcp_error.error.code}).",
+                    http_status_code=status,
+                )
+            what = f"HTTP {status}" if status else f"an error without an answer ({mcp_error.error.message})"
             return DatabricksUnityMCPError(
-                f"Unity Gateway returned HTTP {status} for MCP Service {service!r}.{ambiguous}",
+                f"Unity Gateway returned {what} for MCP Service {service!r}.{ambiguous}",
                 http_status_code=status,
             )
-        if (transport_error := _find_transport_error(error)) is not None:
+        if (transport_error := _find(error, httpx2.TransportError)) is not None:
             return DatabricksUnityMCPTransportError(
                 f"Could not reach Unity Gateway for MCP Service {service!r}: {transport_error}.{ambiguous}"
             )
         return None
 
     @contextlib.asynccontextmanager
-    async def _gateway_errors(self, *, during_tool_call: bool = False) -> AsyncIterator[None]:
+    async def _gateway_operation(self, *, during_tool_call: bool = False) -> AsyncIterator[None]:
+        operation = _Operation(overlapped=bool(self._operations))
+        for other in self._operations:
+            other.overlapped = True
+        self._operations.add(operation)
         try:
             yield
         except Exception as e:
-            translated = self._translate_error(e, during_tool_call=during_tool_call)
+            translated = self._translate_error(e, operation, during_tool_call=during_tool_call)
             if translated is None:
                 raise
             raise translated from e
+        finally:
+            self._operations.discard(operation)
 
     async def __aenter__(self) -> DatabricksUnityMCPToolset:
-        async with self._gateway_errors():
-            await super().__aenter__()
+        async with self._gateway_operation():
+            await (await self._resolve_server()).__aenter__()
         return self
 
+    async def __aexit__(self, *args: Any) -> bool | None:
+        if self._server is not None:
+            return await self._server.__aexit__(*args)
+        return None
+
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
-        async with self._gateway_errors():
-            return await super().get_tools(ctx)
+        async with self._gateway_operation():
+            return await (await self._resolve_server()).get_tools(ctx)
 
     async def execute_tool(
         self,
@@ -335,5 +432,33 @@ class DatabricksUnityMCPToolset(MCPToolset):
         ctx: RunContext[Any],
         tool: ToolsetTool[Any],
     ) -> Any:
-        async with self._gateway_errors(during_tool_call=True):
-            return await super().execute_tool(name, tool_args, ctx=ctx, tool=tool)
+        async with self._gateway_operation(during_tool_call=True):
+            return await (await self._resolve_server()).call_tool(name, tool_args, ctx, tool)
+
+    def airflow_tools(self) -> list[AirflowTool]:
+        """
+        Not supported: use the agent framework's own MCP client instead.
+
+        An MCP session belongs to the event loop that opened it, and the framework-neutral
+        tools run outside the Pydantic AI run that manages it, so every call would reconnect.
+        """
+        raise NotImplementedError(
+            "DatabricksUnityMCPToolset works in Pydantic AI agents and through the LangChain bridge, "
+            "not through the framework-neutral tools."
+        )
+
+
+def _build_proxied_client_factory(proxy: str) -> Any:
+    """Return an MCP HTTP client factory whose clients send requests through ``proxy``."""
+
+    def factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
+        **kwargs: Any,
+    ) -> httpx2.AsyncClient:
+        # The MCP client's defaults: a response stream may stay open, so reads wait longer.
+        timeout = timeout or httpx2.Timeout(30.0, read=300.0)
+        return httpx2.AsyncClient(headers=headers, timeout=timeout, auth=auth, proxy=proxy, **kwargs)
+
+    return factory

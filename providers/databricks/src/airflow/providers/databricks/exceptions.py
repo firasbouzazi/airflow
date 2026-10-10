@@ -53,11 +53,11 @@ class DatabricksUnityMCPError(DatabricksApiError):
 
 
 class DatabricksUnityMCPAccessDeniedError(DatabricksUnityMCPError):
-    """Raised when the gateway rejects the caller's credentials or the caller lacks a privilege on the service."""
+    """
+    Raised when the gateway will not let the caller invoke the service.
 
-
-class DatabricksUnityMCPServiceNotFoundError(DatabricksUnityMCPError):
-    """Raised when the MCP Service does not exist, or is not visible to the caller."""
+    The service may not exist, the caller may lack a privilege on it, or its credentials may be invalid.
+    """
 
 
 class DatabricksUnityMCPThrottledError(DatabricksUnityMCPError):

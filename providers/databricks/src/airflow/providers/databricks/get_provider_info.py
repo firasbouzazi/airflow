@@ -70,7 +70,6 @@ def get_provider_info():
             {
                 "integration-name": "Databricks Unity Gateway",
                 "external-doc-url": "https://docs.databricks.com/aws/en/unity-gateway/concepts",
-                "how-to-guide": ["/docs/apache-airflow-providers-databricks/toolsets/unity_mcp.rst"],
                 "tags": ["service"],
             },
         ],

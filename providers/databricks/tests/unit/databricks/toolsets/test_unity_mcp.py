@@ -37,7 +37,6 @@ from airflow.providers.common.compat.sdk import AirflowOptionalProviderFeatureEx
 from airflow.providers.databricks.exceptions import (
     DatabricksUnityMCPAccessDeniedError,
     DatabricksUnityMCPError,
-    DatabricksUnityMCPServiceNotFoundError,
     DatabricksUnityMCPThrottledError,
     DatabricksUnityMCPTransportError,
 )
@@ -47,16 +46,26 @@ from airflow.providers.databricks.toolsets.unity_mcp import DatabricksUnityMCPTo
 CONN_ID = "databricks_unity"
 SERVICE = "main.tools.genie"
 
+# What Unity Gateway answers, at HTTP 403, for a service the caller may not invoke or that does not exist.
+NOT_AUTHORIZED = {"code": -32007, "message": "Not authorized to invoke MCP service."}
+INVALID_PARAMS = {"code": -32602, "message": "Invalid params: 'text' is required"}
+
 
 class _StubGateway(BaseHTTPRequestHandler):
-    """A Unity Gateway stand-in that serves one MCP Service with a single ``echo`` tool."""
+    """
+    A Unity Gateway stand-in that serves one MCP Service with a single ``echo`` tool.
+
+    A call of ``echo`` whose text is ``"reply <status>"`` gets that HTTP status with an empty body,
+    and ``"reply <status> <error>"`` gets it with the JSON-RPC error named by ``<error>``.
+    """
 
     protocol_version = "HTTP/1.1"
-    # Per-test behaviour, set by the ``gateway`` fixture: service name -> status for every request,
-    # a status for ``tools/call`` requests only, and a status for notifications only.
-    service_status: dict[str, tuple[int, dict[str, str]]] = {}
-    tool_call_status: int | None = None
+    errors = {"not_authorized": NOT_AUTHORIZED, "invalid_params": INVALID_PARAMS}
+    # Per-test behaviour, set by the ``gateway`` fixture: a reply for every request to a service,
+    # a status for notifications only, and a barrier tool calls wait at, so that they overlap.
+    service_reply: dict[str, tuple[int, dict[str, str], str | None]] = {}
     notification_status: int | None = None
+    tool_call_barrier: threading.Barrier | None = None
     requests: list[tuple[str, str | None, str | None]] = []
 
     def do_POST(self):
@@ -64,11 +73,9 @@ class _StubGateway(BaseHTTPRequestHandler):
         method = body.get("method")
         self.requests.append((self.path, self.headers.get("Authorization"), method))
         service = self.path.rsplit("/", 1)[-1]
-        if service in self.service_status:
-            status, headers = self.service_status[service]
-            return self._reply(status, headers=headers)
-        if method == "tools/call" and self.tool_call_status:
-            return self._reply(self.tool_call_status)
+        if service in self.service_reply:
+            status, headers, error = self.service_reply[service]
+            return self._reply_error(status, body.get("id"), error, headers)
         if "id" not in body:
             return self._reply(self.notification_status or 202)
         if method == "initialize":
@@ -88,10 +95,14 @@ class _StubGateway(BaseHTTPRequestHandler):
                 ]
             }
         elif method == "tools/call":
+            if self.tool_call_barrier:
+                self.tool_call_barrier.wait()
             if "text" not in body["params"]["arguments"]:
-                error = {"code": -32602, "message": "Invalid params: 'text' is required"}
-                return self._reply(200, {"jsonrpc": "2.0", "id": body["id"], "error": error})
+                return self._reply(200, {"jsonrpc": "2.0", "id": body["id"], "error": INVALID_PARAMS})
             text = body["params"]["arguments"]["text"]
+            if text.startswith("reply "):
+                status, _, error = text.removeprefix("reply ").partition(" ")
+                return self._reply_error(int(status), body["id"], error or None)
             result = {"content": [{"type": "text", "text": f"echo: {text}"}], "isError": False}
         else:
             result = {}
@@ -102,6 +113,10 @@ class _StubGateway(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._reply(200)
+
+    def _reply_error(self, status, request_id, error, headers=None):
+        payload = {"jsonrpc": "2.0", "id": request_id, "error": self.errors[error]} if error else None
+        self._reply(status, payload, headers)
 
     def _reply(self, status, payload=None, headers=None):
         data = json.dumps(payload).encode() if payload is not None else b""
@@ -120,9 +135,9 @@ class _StubGateway(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def gateway():
-    _StubGateway.service_status = {}
-    _StubGateway.tool_call_status = None
+    _StubGateway.service_reply = {}
     _StubGateway.notification_status = None
+    _StubGateway.tool_call_barrier = None
     _StubGateway.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StubGateway)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -163,6 +178,17 @@ async def _list_and_call(toolset, text="hi"):
     return tools, result
 
 
+async def _call_concurrently(*texts):
+    """Call ``echo`` once per text, all at the same time, and return each call's result or exception."""
+    toolset = DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)
+    async with toolset:
+        tools = await toolset.get_tools(_ctx())
+        return await asyncio.gather(
+            *(toolset.execute_tool("echo", {"text": t}, ctx=_ctx(), tool=tools["echo"]) for t in texts),
+            return_exceptions=True,
+        )
+
+
 class TestServiceName:
     @pytest.mark.parametrize(
         "name",
@@ -173,6 +199,7 @@ class TestServiceName:
             "main.tools.genie?x=1",
             "main.tools.genie#frag",
             "main.tools.ge nie",
+            "main.tools.my-genie",
             "main..genie",
             "evil.example.com/main.tools.genie",
             "",
@@ -228,6 +255,51 @@ class TestServiceUrl:
 
         with pytest.raises(ValueError, match="no workspace host"):
             toolset.get_service_url(DatabricksHook(CONN_ID))
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+    def test_plain_http_is_allowed_to_loopback_only(self, create_connection_without_db, host):
+        create_connection_without_db(
+            Connection(conn_id=CONN_ID, conn_type="databricks", host=host, schema="http", password="t")
+        )
+        toolset = DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)
+
+        assert toolset.get_service_url(DatabricksHook(CONN_ID)).startswith(f"http://{host}/")
+
+    def test_plain_http_to_a_workspace_is_rejected(self, create_connection_without_db):
+        create_connection_without_db(
+            Connection(
+                conn_id=CONN_ID,
+                conn_type="databricks",
+                host="xx.cloud.databricks.com",
+                schema="http",
+                password="t",
+            )
+        )
+        toolset = DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)
+
+        with pytest.raises(ValueError, match="only sent over HTTPS"):
+            toolset.get_service_url(DatabricksHook(CONN_ID))
+
+    def test_requests_go_through_the_connection_proxy(self, gateway, create_connection_without_db):
+        # The stub gateway doubles as the proxy: a proxied request names the full URL in its path.
+        create_connection_without_db(
+            Connection(
+                conn_id=CONN_ID,
+                conn_type="databricks",
+                host="127.0.0.2",
+                port=1,
+                schema="http",
+                password="dapi-token",
+                extra={"proxies": {"http": f"http://127.0.0.1:{gateway.server_address[1]}"}},
+            )
+        )
+
+        _, result = _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)))
+
+        assert result == "echo: hi"
+        assert {path for path, _, _ in _StubGateway.requests} == {
+            f"http://127.0.0.2:1/ai-gateway/mcp-services/{SERVICE}"
+        }
 
 
 class TestAuthentication:
@@ -290,37 +362,86 @@ class TestAuthentication:
 
 class TestErrors:
     @pytest.mark.parametrize(
-        ("status", "headers", "expected", "retry_after"),
+        ("status", "headers", "error", "expected", "retry_after"),
         [
-            (401, {}, DatabricksUnityMCPAccessDeniedError, None),
-            (403, {}, DatabricksUnityMCPAccessDeniedError, None),
-            (404, {}, DatabricksUnityMCPServiceNotFoundError, None),
-            (429, {"Retry-After": "12"}, DatabricksUnityMCPThrottledError, 12.0),
-            (429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, DatabricksUnityMCPThrottledError, None),
+            (401, {}, None, DatabricksUnityMCPAccessDeniedError, None),
+            (403, {}, None, DatabricksUnityMCPAccessDeniedError, None),
+            (403, {}, "not_authorized", DatabricksUnityMCPAccessDeniedError, None),
+            (404, {}, None, DatabricksUnityMCPError, None),
+            (429, {"Retry-After": "12"}, None, DatabricksUnityMCPThrottledError, 12.0),
+            (
+                429,
+                {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+                None,
+                DatabricksUnityMCPThrottledError,
+                None,
+            ),
         ],
     )
-    def test_gateway_errors_are_translated(
-        self, gateway, gateway_conn, status, headers, expected, retry_after
+    def test_gateway_errors_while_connecting_are_translated(
+        self, gateway, gateway_conn, status, headers, error, expected, retry_after
     ):
-        _StubGateway.service_status[SERVICE] = (status, headers)
+        _StubGateway.service_reply[SERVICE] = (status, headers, error)
 
         with pytest.raises(expected) as err:
             _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)))
 
+        assert type(err.value) is expected
         assert err.value.http_status_code == status
         if expected is DatabricksUnityMCPThrottledError:
             assert err.value.retry_after == retry_after
 
-    def test_server_error_during_a_tool_call_says_the_call_may_have_run(self, gateway, gateway_conn):
-        _StubGateway.tool_call_status = 503
+    def test_missing_service_is_reported_as_access_denied(self, gateway, gateway_conn):
+        _StubGateway.service_reply[SERVICE] = (403, {}, "not_authorized")
 
-        with pytest.raises(DatabricksUnityMCPError, match="may or may not have run") as err:
+        with pytest.raises(DatabricksUnityMCPAccessDeniedError, match="no service has that name"):
             _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)))
+
+    def test_server_error_during_a_tool_call_says_the_call_may_have_run(self, gateway, gateway_conn):
+        with pytest.raises(DatabricksUnityMCPError, match="may or may not have run") as err:
+            _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID), "reply 503"))
 
         assert type(err.value) is DatabricksUnityMCPError
         assert err.value.http_status_code == 503
         # The failed call was sent once and not retried.
         assert [m for _, _, m in _StubGateway.requests].count("tools/call") == 1
+
+    def test_denied_tool_call_is_not_left_to_the_model(self, gateway, gateway_conn):
+        with pytest.raises(DatabricksUnityMCPAccessDeniedError):
+            _run(
+                _list_and_call(
+                    DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID), "reply 403 not_authorized"
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "text", ["reply 200 invalid_params", "reply 400 invalid_params", "reply 500 invalid_params"]
+    )
+    def test_json_rpc_error_from_the_server_is_left_to_the_model(self, gateway, gateway_conn, text):
+        # A server may answer bad arguments with a JSON-RPC error at an HTTP error status; it is
+        # still the server's answer, so the model can correct the call.
+        with pytest.raises(ModelRetry, match="'text' is required"):
+            _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID), text))
+
+    def test_concurrent_calls_are_each_judged_by_their_own_failure(self, gateway, gateway_conn):
+        # Calls run in parallel, so another call's response must not change how a failure is
+        # reported: a server error stays a non-retried failure however the other call ends.
+        _StubGateway.tool_call_barrier = threading.Barrier(2, timeout=10)
+        for _ in range(10):
+            failed, succeeded = _run(_call_concurrently("reply 503", "hi"))
+            assert type(failed) is DatabricksUnityMCPError
+            assert "may or may not have run" in str(failed)
+            assert succeeded == "echo: hi"
+
+            failed, throttled = _run(_call_concurrently("reply 503", "reply 429"))
+            # Neither status can be attributed to its call, so neither is reported as throttling.
+            assert type(failed) is DatabricksUnityMCPError
+            assert type(throttled) is DatabricksUnityMCPError
+            assert failed.http_status_code is None
+
+            invalid, failed = _run(_call_concurrently("reply 400 invalid_params", "reply 503"))
+            assert isinstance(invalid, ModelRetry)
+            assert type(failed) is DatabricksUnityMCPError
 
     def test_tool_errors_after_a_tolerated_gateway_error_are_left_to_the_agent(self, gateway, gateway_conn):
         # The MCP client carries on when the gateway rejects a notification; a later tool error the
@@ -347,10 +468,16 @@ class TestErrors:
             _run(_list_and_call(DatabricksUnityMCPToolset(SERVICE, databricks_conn_id=CONN_ID)))
 
 
+class TestFrameworkNeutralTools:
+    def test_are_not_supported(self):
+        with pytest.raises(NotImplementedError, match="framework-neutral"):
+            DatabricksUnityMCPToolset(SERVICE).airflow_tools()
+
+
 class TestOptionalDependency:
     def test_import_without_common_ai_names_the_extra(self):
         module = "airflow.providers.databricks.toolsets.unity_mcp"
-        with mock.patch.dict(sys.modules, {"airflow.providers.common.ai.toolsets.mcp": None}):
+        with mock.patch.dict(sys.modules, {"airflow.providers.common.ai.utils.toolset_base": None}):
             sys.modules.pop(module)
             with pytest.raises(AirflowOptionalProviderFeatureException, match=r"databricks\[common.ai\]"):
                 importlib.import_module(module)

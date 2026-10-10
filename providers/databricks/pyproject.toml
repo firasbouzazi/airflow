@@ -89,7 +89,7 @@ dependencies = [
     "azure-identity>=1.25.3",
 ]
 "common.ai" = [
-    "apache-airflow-providers-common-ai[mcp]>=0.10.0",  # use next version
+    "apache-airflow-providers-common-ai[mcp]>=0.11.0",  # use next version
 ]
 "fab" = [
     "apache-airflow-providers-fab>=2.2.0"
